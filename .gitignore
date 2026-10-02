@@ -4,8 +4,9 @@ __pycache__/
 .idea/
 .vscode/
 
-# 脚本运行生成的图片/结果
-outputs/
+# 脚本运行生成的图片/结果（保留目录本身，忽略里面生成的文件）
+outputs/*
+!outputs/.gitkeep
 
 # 演示残留
 *.log

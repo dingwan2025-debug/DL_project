@@ -19,4 +19,4 @@ python 04_pytorch_cnn.py
 
 - 数据来自 `sklearn.datasets.load_digits`，无需联网下载，CPU 上十几秒即可跑完 10 个 epoch。
 - 未安装 PyTorch 时脚本会打印提示并直接跳过，不会报错。
-- 运行结果图保存在 `outputs/04_pytorch_cnn.png`（该目录不进版本库）。
+- 运行结果图保存在 `outputs/04_pytorch_cnn.png`。`outputs/` 目录由脚本自动创建，目录本身纳入版本库，里面生成的图片不提交。
