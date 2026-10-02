@@ -13,9 +13,10 @@
     python 04_pytorch_cnn.py                          # 默认 10 个 epoch
     python 04_pytorch_cnn.py --epochs 20 --lr 0.005   # 换超参数再跑一次
     python 04_pytorch_cnn.py --outdir outputs/exp1    # 结果存到别的目录
+    python 04_pytorch_cnn.py --eval-only             # 不训练，载入已有权重直接评估
 
 每次运行都会把超参数和训练曲线写进 <outdir>/04_pytorch_cnn_metrics.json，
-方便对比不同设置的效果。
+并给出混淆矩阵和分类报告，方便对比不同设置的效果。
 """
 
 import argparse
@@ -64,6 +65,11 @@ def parse_args(argv=None):
         type=str,
         default=DEFAULT_CONFIG["outdir"],
         help="结果输出目录，相对路径按脚本所在目录解释",
+    )
+    parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        help="跳过训练，直接载入 <outdir>/04_pytorch_cnn.pt 评估已有模型",
     )
     return parser.parse_args(argv)
 
@@ -165,7 +171,110 @@ def train_model(model, train_loader, X_test, y_test, epochs, lr):
     return history
 
 
-def save_metrics(out_dir, config, history, n_train, n_test, n_errors):
+def evaluate_model(model, X_test):
+    """在测试集上推理，返回预测标签张量。"""
+    model.eval()
+    with torch.no_grad():
+        pred = model(X_test).argmax(dim=1)
+    return pred
+
+
+def save_checkpoint(path, model, config):
+    """只保存权重和配置，文件小，也方便以后复用这套权重。"""
+    torch.save({"state_dict": model.state_dict(), "config": config}, path)
+    return path
+
+
+def load_checkpoint(path, model):
+    """把权重载回模型，供 --eval-only 复现之前的评估结果。"""
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    model.load_state_dict(checkpoint["state_dict"])
+    return checkpoint
+
+
+def summarize_classification(y_true, y_pred, out_dir):
+    """画 10x10 混淆矩阵，并给出每个数字的 precision/recall/f1。
+
+    准确率只是一个总数，看不出"哪个数字容易被认错"；
+    混淆矩阵和分类报告正好补上这部分信息。
+    """
+    from sklearn.metrics import classification_report, confusion_matrix
+
+    labels = list(range(10))
+    cm = confusion_matrix(y_true, y_pred, labels=labels)
+    report = classification_report(y_true, y_pred, labels=labels, digits=3)
+
+    fig, ax = plt.subplots(figsize=(5.9, 5.2))
+    im = ax.imshow(cm, cmap="Blues")
+    ax.set_title("混淆矩阵（行=真实数字，列=预测数字）")
+    ax.set_xlabel("预测")
+    ax.set_ylabel("真实")
+    ax.set_xticks(labels)
+    ax.set_yticks(labels)
+    ax.grid(False)
+    for i in labels:
+        for j in labels:
+            if cm[i, j]:
+                ax.text(
+                    j,
+                    i,
+                    str(cm[i, j]),
+                    ha="center",
+                    va="center",
+                    fontsize=7,
+                    color="white" if cm[i, j] > cm.max() / 2 else "black",
+                )
+    fig.colorbar(im, ax=ax, fraction=0.046)
+    fig.tight_layout()
+    path = out_dir / "04_pytorch_cnn_confusion.png"
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+
+    return path, cm.tolist(), report
+
+
+def plot_predictions(history, X_test, y_test, pred, out_dir):
+    """画训练曲线和几张错分样本（标题里 T=真实值，P=预测值）。
+
+    --eval-only 时没有训练曲线，就只画错分样本。
+    """
+    wrong = (pred != y_test).nonzero(as_tuple=True)[0]
+    show = wrong[:4]
+
+    fig = plt.figure(figsize=(11, 5.2) if history else (8.0, 2.8))
+    start = 0
+    if history:
+        ax1 = fig.add_subplot(2, 3, 1)
+        ax1.plot(history["loss"], color="tab:blue")
+        ax1.set_title("训练损失")
+        ax1.set_xlabel("epoch")
+        ax1.grid(alpha=0.3)
+
+        ax2 = fig.add_subplot(2, 3, 2)
+        ax2.plot(history["acc"], color="tab:green")
+        ax2.set_title("测试准确率")
+        ax2.set_xlabel("epoch")
+        ax2.grid(alpha=0.3)
+        start = 2
+
+    for i, idx in enumerate(show):
+        ax = fig.add_subplot(2, 3, start + i + 1)
+        ax.imshow(X_test[idx, 0], cmap="gray")
+        ax.set_title(f"T={y_test[idx].item()} / P={pred[idx].item()}", fontsize=9)
+        ax.axis("off")
+    if len(show) == 0:
+        ax = fig.add_subplot(2, 3, start + 1)
+        ax.text(0.5, 0.5, "测试集全部预测正确", ha="center", va="center")
+        ax.axis("off")
+
+    fig.tight_layout()
+    path = out_dir / "04_pytorch_cnn.png"
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+    return path
+
+
+def save_metrics(out_dir, config, history, n_train, n_test, n_errors, confusion=None, report=None):
     """把这次实验的超参数和结果写成 JSON，方便多次运行之间对比。"""
     metrics = {
         "config": config,
@@ -173,10 +282,15 @@ def save_metrics(out_dir, config, history, n_train, n_test, n_errors):
         "n_train": n_train,
         "n_test": n_test,
         "n_errors": n_errors,
-        "final_test_accuracy": history["acc"][-1],
-        "best_test_accuracy": max(history["acc"]),
         "history": history,
     }
+    if history:
+        metrics["final_test_accuracy"] = history["acc"][-1]
+        metrics["best_test_accuracy"] = max(history["acc"])
+    if confusion is not None:
+        metrics["confusion_matrix"] = confusion
+    if report is not None:
+        metrics["classification_report"] = report
     path = out_dir / "04_pytorch_cnn_metrics.json"
     path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
@@ -200,48 +314,40 @@ def main(argv=None):
     model = SmallCNN()
     print(f"模型结构：\n{model}\n")
 
-    train_loader = DataLoader(
-        TensorDataset(X_train, y_train), batch_size=args.batch_size, shuffle=True
-    )
-    history = train_model(model, train_loader, X_test, y_test, epochs=args.epochs, lr=args.lr)
+    checkpoint_path = out_dir / "04_pytorch_cnn.pt"
+    if args.eval_only:
+        if not checkpoint_path.exists():
+            print(f"找不到模型文件：{checkpoint_path}")
+            print("请先不带 --eval-only 训练一次，生成权重后再评估。")
+            sys.exit(1)
+        load_checkpoint(checkpoint_path, model)
+        print(f"已载入权重 {checkpoint_path}，跳过训练（--eval-only）\n")
+        history = None
+    else:
+        train_loader = DataLoader(
+            TensorDataset(X_train, y_train), batch_size=args.batch_size, shuffle=True
+        )
+        history = train_model(
+            model, train_loader, X_test, y_test, epochs=args.epochs, lr=args.lr
+        )
+        save_checkpoint(checkpoint_path, model, vars(args))
+        print(f"\n模型权重已保存：{checkpoint_path}")
 
-    # 看一下预测错的样本长什么样
-    model.eval()
-    with torch.no_grad():
-        pred = model(X_test).argmax(dim=1)
+    # 测试集评估：准确率之外，再看混淆矩阵和分类报告
+    pred = evaluate_model(model, X_test)
     wrong = (pred != y_test).nonzero(as_tuple=True)[0]
-    print(f"\n测试集错误 {len(wrong)} / {len(X_test)} 张，最终准确率 {history['acc'][-1]:.3f}")
+    if history:
+        print(f"\n测试集错误 {len(wrong)} / {len(X_test)} 张，最终准确率 {history['acc'][-1]:.3f}")
+    else:
+        acc = (pred == y_test).float().mean().item()
+        print(f"\n测试集错误 {len(wrong)} / {len(X_test)} 张，准确率 {acc:.3f}")
 
-    # 可视化：训练曲线 + 部分预测结果（标题里 T=真实值，P=预测值）
-    fig = plt.figure(figsize=(11, 5.2))
-    ax1 = fig.add_subplot(2, 3, 1)
-    ax1.plot(history["loss"], color="tab:blue")
-    ax1.set_title("训练损失")
-    ax1.set_xlabel("epoch")
-    ax1.grid(alpha=0.3)
+    cm_path, cm, report = summarize_classification(y_test.numpy(), pred.numpy(), out_dir)
+    print(f"\n混淆矩阵已保存：{cm_path}")
+    print("\n分类报告（precision / recall / f1-score）：")
+    print(report)
 
-    ax2 = fig.add_subplot(2, 3, 2)
-    ax2.plot(history["acc"], color="tab:green")
-    ax2.set_title("测试准确率")
-    ax2.set_xlabel("epoch")
-    ax2.grid(alpha=0.3)
-
-    # 取几张错得最典型的样本（2x3 网格中第 3~6 格留给图片）
-    show = wrong[:4] if len(wrong) >= 4 else wrong
-    for i, idx in enumerate(show):
-        ax = fig.add_subplot(2, 3, 3 + i)
-        ax.imshow(X_test[idx, 0], cmap="gray")
-        ax.set_title(f"T={y_test[idx].item()} / P={pred[idx].item()}", fontsize=9)
-        ax.axis("off")
-    if len(show) == 0:
-        ax = fig.add_subplot(2, 3, 3)
-        ax.text(0.5, 0.5, "测试集全部预测正确", ha="center", va="center")
-        ax.axis("off")
-
-    fig.tight_layout()
-    save_path = out_dir / "04_pytorch_cnn.png"
-    fig.savefig(save_path, dpi=140)
-    plt.close(fig)
+    save_path = plot_predictions(history, X_test, y_test, pred, out_dir)
     print(f"图片已保存：{save_path}")
 
     metrics_path = save_metrics(
@@ -251,6 +357,8 @@ def main(argv=None):
         n_train=len(X_train),
         n_test=len(X_test),
         n_errors=len(wrong),
+        confusion=cm,
+        report=report,
     )
     print(f"训练记录已保存：{metrics_path}")
 
